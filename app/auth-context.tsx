@@ -2,77 +2,136 @@
 
 import * as React from 'react';
 
-type MockUser = {
-  email: string;
-  name: string;
-};
+import type { PublicUser } from '@/lib/types';
+
+export type AuthUser = PublicUser;
+
+export type AuthResult = { ok: true } | { ok: false; error: string };
 
 type AuthContextValue = {
-  user: MockUser | null;
+  user: AuthUser | null;
   isLoading: boolean;
-  signIn: (email: string) => void;
-  signUp: (email: string) => void;
-  signOut: () => void;
+  signIn: (email: string, password: string) => Promise<AuthResult>;
+  signUp: (email: string, password: string) => Promise<AuthResult>;
+  signOut: () => Promise<void>;
+  /** Re-reads /api/auth/me. Used when an API call reports a dead session. */
+  refreshUser: () => Promise<void>;
 };
 
 const AuthContext = React.createContext<AuthContextValue | undefined>(undefined);
 
-const STORAGE_KEY = 'notelatte:user';
+/** Left over from the mock-auth prototype; cleared on boot so a stale blob can't
+ *  make a signed-out browser look signed in. */
+const LEGACY_STORAGE_KEY = 'notelatte:user';
 
-function nameFromEmail(email: string): string {
-  const localPart = email.split('@')[0] || 'Friend';
-  return localPart
-    .replace(/[._-]+/g, ' ')
-    .split(' ')
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ');
+async function readErrorMessage(response: Response, fallback: string): Promise<string> {
+  try {
+    const data = (await response.json()) as { error?: string };
+    return data.error || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = React.useState<MockUser | null>(null);
+  const [user, setUser] = React.useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = React.useState(true);
 
-  React.useEffect(() => {
+  const refreshUser = React.useCallback(async () => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as MockUser;
-        setUser(parsed);
+      const response = await fetch('/api/auth/me', {
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+
+      if (!response.ok) {
+        setUser(null);
+        return;
       }
+
+      const data = (await response.json()) as { user: AuthUser | null };
+      setUser(data.user ?? null);
     } catch {
-      // ignore malformed storage
+      setUser(null);
     }
-    setIsLoading(false);
   }, []);
 
-  const persist = (next: MockUser | null) => {
-    setUser(next);
+  React.useEffect(() => {
+    let cancelled = false;
+
     try {
-      if (next) {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-      } else {
-        localStorage.removeItem(STORAGE_KEY);
-      }
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
     } catch {
-      // ignore storage failures (private mode, etc.)
+      // storage unavailable (private mode) — nothing to clean up
     }
-  };
 
-  const signIn = (email: string) => {
-    persist({ email, name: nameFromEmail(email) });
-  };
+    (async () => {
+      await refreshUser();
+      if (!cancelled) setIsLoading(false);
+    })();
 
-  const signUp = (email: string) => {
-    persist({ email, name: nameFromEmail(email) });
-  };
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshUser]);
 
-  const signOut = () => {
-    persist(null);
-  };
+  const signIn = React.useCallback(async (email: string, password: string): Promise<AuthResult> => {
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+        credentials: 'same-origin',
+      });
+
+      if (!response.ok) {
+        return { ok: false, error: await readErrorMessage(response, 'Could not sign you in.') };
+      }
+
+      const data = (await response.json()) as { user: AuthUser };
+      setUser(data.user);
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Network error — please try again.' };
+    }
+  }, []);
+
+  const signUp = React.useCallback(async (email: string, password: string): Promise<AuthResult> => {
+    try {
+      const response = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+        credentials: 'same-origin',
+      });
+
+      if (!response.ok) {
+        return {
+          ok: false,
+          error: await readErrorMessage(response, 'Could not create your account.'),
+        };
+      }
+
+      const data = (await response.json()) as { user: AuthUser };
+      setUser(data.user);
+      return { ok: true };
+    } catch {
+      return { ok: false, error: 'Network error — please try again.' };
+    }
+  }, []);
+
+  const signOut = React.useCallback(async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    } catch {
+      // Even if the request fails the local session is dropped below; the cookie
+      // will expire on its own.
+    }
+    setUser(null);
+  }, []);
 
   return (
-    <AuthContext.Provider value={{ user, isLoading, signIn, signUp, signOut }}>
+    <AuthContext.Provider value={{ user, isLoading, signIn, signUp, signOut, refreshUser }}>
       {children}
     </AuthContext.Provider>
   );

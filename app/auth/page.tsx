@@ -11,6 +11,24 @@ import { NotebookPen } from 'lucide-react';
 import { useAuth } from '@/app/auth-context';
 
 export default function AuthPage() {
+  // useSearchParams() must be inside a Suspense boundary or the static build of
+  // this route fails during prerender (Next 13.4+).
+  return (
+    <React.Suspense fallback={<AuthPageFallback />}>
+      <AuthPageForm />
+    </React.Suspense>
+  );
+}
+
+function AuthPageFallback() {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-neutral-50/60 text-neutral-400">
+      <NotebookPen className="h-6 w-6 animate-pulse" />
+    </div>
+  );
+}
+
+function AuthPageForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { user, isLoading, signIn, signUp } = useAuth();
@@ -22,6 +40,7 @@ export default function AuthPage() {
   const [password, setPassword] = React.useState('');
   const [confirmPassword, setConfirmPassword] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
 
   React.useEffect(() => {
     if (!isLoading && user) {
@@ -29,8 +48,9 @@ export default function AuthPage() {
     }
   }, [isLoading, user, router]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     setError(null);
 
     const trimmedEmail = email.trim();
@@ -47,12 +67,22 @@ export default function AuthPage() {
       return;
     }
 
-    if (mode === 'signin') {
-      signIn(trimmedEmail);
-    } else {
-      signUp(trimmedEmail);
+    setIsSubmitting(true);
+    try {
+      const result =
+        mode === 'signin'
+          ? await signIn(trimmedEmail, password)
+          : await signUp(trimmedEmail, password);
+
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+
+      router.replace('/');
+    } finally {
+      setIsSubmitting(false);
     }
-    router.replace('/');
   };
 
   const switchMode = (next: 'signin' | 'signup') => {
@@ -131,9 +161,10 @@ export default function AuthPage() {
 
               <Button
                 type="submit"
-                className="mt-2 h-10 bg-neutral-900 text-white hover:bg-neutral-800"
+                disabled={isSubmitting}
+                className="mt-2 h-10 bg-neutral-900 text-white hover:bg-neutral-800 disabled:opacity-50"
               >
-                Continue
+                {isSubmitting ? 'Please wait...' : 'Continue'}
                 <ArrowRight className="ml-1.5 h-4 w-4" />
               </Button>
             </form>
@@ -166,7 +197,7 @@ export default function AuthPage() {
           </div>
 
           <p className="mt-6 text-center text-xs text-neutral-400">
-            This is a prototype — no real account is created.
+            Your notes are stored securely in your account.
           </p>
         </div>
       </div>

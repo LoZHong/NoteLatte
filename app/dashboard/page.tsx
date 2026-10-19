@@ -44,16 +44,16 @@ import {
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/app/auth-context';
+import type { NoteDTO as Note, NoteStatus as Status } from '@/lib/types';
 
-type Status = 'Todo' | 'In-Progress' | 'On-Hold' | 'Done';
-
-type Note = {
-  id: string;
-  title: string;
-  status: Status;
-  content: string;
-  updatedAt: number;
-};
+async function readError(response: Response, fallback: string): Promise<string> {
+  try {
+    const data = (await response.json()) as { error?: string };
+    return data.error || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 const STATUS_ORDER: Status[] = ['Todo', 'In-Progress', 'On-Hold', 'Done'];
 
@@ -72,73 +72,6 @@ const STATUS_DOT: Record<Status, string> = {
 };
 
 const FILTERS: ('All' | Status)[] = ['All', ...STATUS_ORDER];
-
-const INITIAL_NOTES: Note[] = [
-  {
-    id: '1',
-    title: 'Q4 Product Roadmap',
-    status: 'In-Progress',
-    content:
-      'Outline the key initiatives for Q4 including the new analytics dashboard, billing revamp, and mobile app beta. Coordinate with design on wireframes by end of week and schedule a review with stakeholders.',
-    updatedAt: Date.now() - 1000 * 60 * 35,
-  },
-  {
-    id: '2',
-    title: 'Onboarding Flow Redesign',
-    status: 'Todo',
-    content:
-      'Audit the existing signup experience, identify drop-off points, and propose a three-step onboarding with progress indicators. Pull metrics from Mixpanel before Thursday.',
-    updatedAt: Date.now() - 1000 * 60 * 60 * 2,
-  },
-  {
-    id: '3',
-    title: 'Customer Feedback Synthesis',
-    status: 'Done',
-    content:
-      'Compiled 240 responses from the September NPS survey into five themes. Top request: bulk export. Full report shared in the #product Slack channel.',
-    updatedAt: Date.now() - 1000 * 60 * 60 * 26,
-  },
-  {
-    id: '4',
-    title: 'API Rate Limiting Plan',
-    status: 'On-Hold',
-    content:
-      'Drafting a tiered rate-limit strategy for v2 of the public API. Waiting on the infrastructure team to confirm Redis availability before finalizing the token bucket approach.',
-    updatedAt: Date.now() - 1000 * 60 * 60 * 50,
-  },
-  {
-    id: '5',
-    title: 'Marketing Site Copy Refresh',
-    status: 'In-Progress',
-    content:
-      'Rewriting the hero, features, and pricing sections to match the new brand voice. Hero draft is in review with Sarah; pricing section still needs the FAQ block.',
-    updatedAt: Date.now() - 1000 * 60 * 60 * 5,
-  },
-  {
-    id: '6',
-    title: 'Hire a Senior Designer',
-    status: 'Todo',
-    content:
-      'Update the job description, post to LinkedIn and Read.cv, and build a shortlist of portfolios. Aim to have first interviews scheduled within two weeks.',
-    updatedAt: Date.now() - 1000 * 60 * 60 * 8,
-  },
-  {
-    id: '7',
-    title: 'Migration to PostgreSQL 16',
-    status: 'On-Hold',
-    content:
-      'Tested the extension compatibility in staging. Paused pending the seasonal traffic slowdown in November to avoid any risk during peak hours.',
-    updatedAt: Date.now() - 1000 * 60 * 60 * 72,
-  },
-  {
-    id: '8',
-    title: 'Weekly Team Retro Notes',
-    status: 'Done',
-    content:
-      'Action items: ship the search fix, document the deploy process, and schedule a pairing session on testing. Next retro scheduled for Friday at 3pm.',
-    updatedAt: Date.now() - 1000 * 60 * 60 * 30,
-  },
-];
 
 function formatRelativeTime(ts: number): string {
   const diff = Date.now() - ts;
@@ -164,9 +97,11 @@ function initials(name: string): string {
 
 export default function DashboardPage() {
   const router = useRouter();
-  const { user, isLoading, signOut } = useAuth();
+  const { user, isLoading, signOut, refreshUser } = useAuth();
 
-  const [notes, setNotes] = React.useState<Note[]>(INITIAL_NOTES);
+  const [notes, setNotes] = React.useState<Note[]>([]);
+  const [notesLoading, setNotesLoading] = React.useState(false);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
   const [activeFilter, setActiveFilter] = React.useState<'All' | Status>('All');
   const [search, setSearch] = React.useState('');
 
@@ -175,6 +110,8 @@ export default function DashboardPage() {
   const [title, setTitle] = React.useState('');
   const [status, setStatus] = React.useState<Status>('Todo');
   const [content, setContent] = React.useState('');
+  const [formError, setFormError] = React.useState<string | null>(null);
+  const [saving, setSaving] = React.useState(false);
 
   React.useEffect(() => {
     if (!isLoading && !user) {
@@ -182,11 +119,44 @@ export default function DashboardPage() {
     }
   }, [isLoading, user, router]);
 
+  const loadNotes = React.useCallback(async () => {
+    setNotesLoading(true);
+    setLoadError(null);
+    try {
+      const response = await fetch('/api/notes', {
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        await refreshUser();
+        return;
+      }
+      if (!response.ok) {
+        setLoadError(await readError(response, 'Could not load your notes.'));
+        return;
+      }
+
+      const data = (await response.json()) as { notes: Note[] };
+      setNotes(data.notes);
+    } catch {
+      setLoadError('Could not load your notes.');
+    } finally {
+      setNotesLoading(false);
+    }
+  }, [refreshUser]);
+
+  React.useEffect(() => {
+    if (!user) return;
+    void loadNotes();
+  }, [user, loadNotes]);
+
   const openCreate = () => {
     setEditingId(null);
     setTitle('');
     setStatus('Todo');
     setContent('');
+    setFormError(null);
     setModalOpen(true);
   };
 
@@ -195,41 +165,77 @@ export default function DashboardPage() {
     setTitle(note.title);
     setStatus(note.status);
     setContent(note.content);
+    setFormError(null);
     setModalOpen(true);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const trimmedTitle = title.trim();
-    if (!trimmedTitle) return;
+    if (!trimmedTitle || saving) return;
 
-    if (editingId) {
+    setSaving(true);
+    setFormError(null);
+
+    try {
+      const payload = { title: trimmedTitle, status, content: content.trim() };
+      const response = await fetch(editingId ? `/api/notes/${editingId}` : '/api/notes', {
+        method: editingId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        await refreshUser();
+        return;
+      }
+      if (!response.ok) {
+        setFormError(await readError(response, 'Could not save the note.'));
+        return;
+      }
+
+      const data = (await response.json()) as { note: Note };
       setNotes((prev) =>
-        prev.map((n) =>
-          n.id === editingId
-            ? { ...n, title: trimmedTitle, status, content: content.trim(), updatedAt: Date.now() }
-            : n
-        )
+        editingId
+          ? prev.map((n) => (n.id === data.note.id ? data.note : n))
+          : [data.note, ...prev]
       );
-    } else {
-      const newNote: Note = {
-        id: `${Date.now()}`,
-        title: trimmedTitle,
-        status,
-        content: content.trim(),
-        updatedAt: Date.now(),
-      };
-      setNotes((prev) => [newNote, ...prev]);
+      setModalOpen(false);
+    } catch {
+      setFormError('Network error — please try again.');
+    } finally {
+      setSaving(false);
     }
-
-    setModalOpen(false);
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
+    const snapshot = notes;
+    setLoadError(null);
     setNotes((prev) => prev.filter((n) => n.id !== id));
+
+    try {
+      const response = await fetch(`/api/notes/${id}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        await refreshUser();
+        return;
+      }
+      // 404 means it is already gone — the UI is already correct.
+      if (!response.ok && response.status !== 404) {
+        setNotes(snapshot);
+        setLoadError(await readError(response, 'Could not delete that note.'));
+      }
+    } catch {
+      setNotes(snapshot);
+      setLoadError('Could not delete that note.');
+    }
   };
 
-  const handleSignOut = () => {
-    signOut();
+  const handleSignOut = async () => {
+    await signOut();
     router.replace('/');
   };
 
@@ -357,8 +363,16 @@ export default function DashboardPage() {
           })}
         </div>
 
+        {loadError && (
+          <p className="mt-6 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{loadError}</p>
+        )}
+
         {/* Notes grid */}
-        {filteredNotes.length > 0 ? (
+        {notesLoading && notes.length === 0 ? (
+          <div className="mt-16 flex items-center justify-center text-neutral-400">
+            <NotebookPen className="h-6 w-6 animate-pulse" />
+          </div>
+        ) : filteredNotes.length > 0 ? (
           <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {filteredNotes.map((note) => (
               <article
@@ -435,7 +449,13 @@ export default function DashboardPage() {
       </div>
 
       {/* Create / Edit modal */}
-      <Dialog open={modalOpen} onOpenChange={setModalOpen}>
+      <Dialog
+        open={modalOpen}
+        onOpenChange={(open) => {
+          setModalOpen(open);
+          if (!open) setFormError(null);
+        }}
+      >
         <DialogContent className="sm:max-w-[480px]">
           <DialogHeader>
             <DialogTitle>{editingId ? 'Edit note' : 'Create a new note'}</DialogTitle>
@@ -488,6 +508,10 @@ export default function DashboardPage() {
                 className="resize-none"
               />
             </div>
+
+            {formError && (
+              <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{formError}</p>
+            )}
           </div>
 
           <DialogFooter>
@@ -500,10 +524,10 @@ export default function DashboardPage() {
             </Button>
             <Button
               onClick={handleSave}
-              disabled={!title.trim()}
+              disabled={!title.trim() || saving}
               className="bg-neutral-900 text-white hover:bg-neutral-800 disabled:opacity-50"
             >
-              {editingId ? 'Save changes' : 'Create note'}
+              {saving ? 'Saving...' : editingId ? 'Save changes' : 'Create note'}
             </Button>
           </DialogFooter>
         </DialogContent>
