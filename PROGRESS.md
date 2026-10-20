@@ -4,9 +4,9 @@
 | --- | --- |
 | Project | NoteLatte — minimalist Notion-style notes app |
 | Repository | `github.com/LoZHong/NoteLatte` (branch `main`) |
-| Report date | 2026-10-20 18:45 (UTC+8) |
-| Current status | Feature-complete MVP plus card interaction pass. Build, lint and type checks green. Verified against the production Neon database. Ready for Vercel deployment. |
-| Latest commit | `19fb950` — Add card interactions: click-to-edit, status cycling, pinning, drag reorder |
+| Report date | 2026-10-20 18:55 (UTC+8) |
+| Current status | Feature-complete MVP with card interactions and an anonymous guest mode. Build, lint and type checks green. Verified against the production Neon database and against `localStorage`. Ready for Vercel deployment. |
+| Latest commit | `ca6df30` — Add anonymous guest mode with a localStorage storage driver |
 | Working tree | Clean |
 
 ---
@@ -28,9 +28,13 @@ application** with a real relational database and real session authentication.
 - **Interactions:** Click any card to edit it in place; click a status badge to cycle
   `Todo → In-Progress → On-Hold → Done`; pin a card to float it above the rest; drag cards to
   reorder them. All four mutations persist to Postgres immediately.
+- **Guest mode:** `/dashboard` is usable without an account. Visitors get a local-first workspace
+  backed by `localStorage["notelatte_guest_notes"]`, seeded with four example notes, with zero
+  calls to the notes APIs. Signing in offers a one-time import into the cloud account.
 
-No mock state, no `localStorage` session, and no hardcoded seed array remains in the application
-code. The prototype's 8 demo notes were retired; new accounts start on the existing empty state.
+Mock authentication no longer exists: the session is a server-issued JWT in an HttpOnly cookie,
+never a `localStorage` blob. The prototype's 8 demo notes were retired; cloud accounts start empty,
+while Guest Mode seeds four local examples into the browser.
 
 ---
 
@@ -48,6 +52,7 @@ implementation on day one: **94 minutes** between the UI prototype commit and th
 | 5 | 2026-10-19 20:07 | **First real usage** (post-handover) | — | Two real accounts created and 6 notes written through the UI, confirming end-to-end persistence outside the test harness. Data preserved. |
 | 6 | 2026-10-20 18:17 | **Re-verification** | — | Cold rebuild, lint, typecheck, API matrix re-run (22/22), test-data cleanup, this report. |
 | 7 | 2026-10-20 18:40 | **UX interaction pass** | `19fb950` | Click-to-edit cards, status badge cycling, pin/unpin with `isPinned` + `sortOrder` columns, drag-and-drop reordering via `PUT /api/notes/order`, pre-formatted multiline card body, header logo link, and a lobby that stays reachable while signed in. |
+| 8 | 2026-10-20 18:50 | **Anonymous guest mode** (local-first) | `ca6df30` | `/dashboard` unblocked for visitors; a `NotesDriver` contract with two implementations (authenticated API vs `localStorage`); seeded guest workspace; guest-only lifecycle banner; explicit guest-note import on sign-in; landing-page guest CTA. |
 
 ### Detail — milestone 4 (the integration)
 
@@ -108,6 +113,9 @@ lib/
   validation.ts           zod schemas + firstIssue()
   serializers.ts          toNoteDTO(), toPublicUser()
   types.ts                NoteStatus, NoteDTO, PublicUser
+  note-order.ts           pinned-first comparator shared by dashboard and drivers
+  notes-driver.ts         NotesDriver contract, NotesDriverError, cloud driver
+  guest-notes.ts          localStorage driver, seeding, peek/clear helpers
 prisma/schema.prisma      User, Note
 ```
 
@@ -183,6 +191,30 @@ Notes are serialized with `updatedAt` as **epoch milliseconds**, preserving the 
 - **Rendering.** Card bodies use `whitespace-pre-wrap break-words line-clamp-4`, so explicit
   newlines survive and long tokens wrap instead of overflowing.
 
+### 3.8 Dual storage drivers (guest vs cloud)
+
+`lib/notes-driver.ts` defines one contract — `list`, `create`, `update`, `remove`, `reorder` —
+with two implementations selected by the presence of a session:
+
+| | `guestNotesDriver` | `cloudNotesDriver` |
+| --- | --- | --- |
+| Backing store | `localStorage["notelatte_guest_notes"]` | Neon PostgreSQL via `/api/notes` |
+| Network | None | One request per operation |
+| Failure mode | `NotesDriverError` with no status | `NotesDriverError` carrying the HTTP status |
+| IDs | `guest-<uuid>` | Prisma `cuid` |
+| Ordering | `sortOrder` reassigned locally | `PUT /api/notes/order` transaction |
+
+- The page holds a single `driver` reference, so every handler (save, delete, pin, status cycle,
+  reorder) is written once and stays mode-agnostic.
+- `NotesDriverError.status` lets the page treat `401` as "session died" (call `refreshUser()`) and
+  `404` as "already gone", without string matching.
+- Guest seeding happens only when the storage key is absent or unparseable. An intentionally
+  emptied array stays empty, so deletions do not resurrect on reload.
+- If `localStorage` throws (private mode, quota, disabled storage), the driver keeps an in-memory
+  copy so the session still works; it simply stops surviving reloads.
+- `peekGuestNotes()` is a non-seeding read used only by the signed-in import prompt, so cloud
+  users never get guest seed data injected into their browser.
+
 ---
 
 ## 4. Current Environment & Verification
@@ -201,7 +233,7 @@ Notes are serialized with `updatedAt` as **epoch milliseconds**, preserving the 
 | Database | Neon PostgreSQL (`neondb`, pooled endpoint, `sslmode=require`) |
 | Vercel CLI | 64.5.0 (installed, **not logged in**) |
 
-### 4.2 Build verification — 2026-10-20 18:40 UTC+8
+### 4.2 Build verification — 2026-10-20 18:53 UTC+8
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -212,9 +244,9 @@ Notes are serialized with `updatedAt` as **epoch milliseconds**, preserving the 
 Route manifest:
 
 ```
-○ /                    3.63 kB      91.7 kB
+○ /                    3.80 kB      91.9 kB
 ○ /auth                3.48 kB      91.6 kB
-○ /dashboard          47.3 kB       135 kB
+○ /dashboard          49.3 kB       137 kB
 λ /api/auth/login      λ /api/auth/logout   λ /api/auth/me
 λ /api/auth/register   λ /api/notes         λ /api/notes/[id]
 λ /api/notes/order
@@ -278,6 +310,21 @@ Interaction pass, same session:
 - Current database contents: **2 accounts, 7 notes** (real usage created after handover).
   Preserved as-is.
 
+### 4.6 Guest mode verification (2026-10-20 18:50, real browser)
+
+| Check | Observed |
+| --- | --- |
+| Route guard | Signed-out visitor loads `/dashboard` directly; no redirect to `/auth` |
+| Seed | First open writes 4 notes to `localStorage["notelatte_guest_notes"]` |
+| Banner | Guest-only strip with "Local Storage (Single Device only)", the erase warning and the "Sign In to Sync Across Devices" CTA |
+| Network isolation | Resource timeline shows only `/api/auth/me` — **zero** requests to `/api/notes` or `/api/notes/order` |
+| Guest create | New card appears immediately; storage count 4 → 5 |
+| Guest mutations | Status cycle, pin, drag reorder and delete all persisted to `sortOrder`/`status`/`isPinned` in storage |
+| Reload | Order, pins, statuses and deletions all survived a hard reload |
+| Import | After signup, the cloud account showed the "4 notes from Guest Mode" prompt; importing created all four server-side and cleared the local key |
+| Landing CTA | "Try Instant Demo as Guest (No sign up required)" navigates to `/dashboard` and seeds a fresh guest workspace |
+| Auth redirect | Fixed a race where the "already signed in" effect sent users to `/` instead of `/dashboard` |
+
 ---
 
 ## 5. Deployment Readiness (Vercel)
@@ -321,7 +368,10 @@ false-positive readiness signal.
 
 | Priority | Item | Notes |
 | --- | --- | --- |
-| Medium | No `middleware.ts` route gate | A signed-out visitor can load the dashboard HTML shell before the client redirect fires. No data is exposed (all APIs return 401), but an edge gate would remove the flash. Requires `JWT_SECRET` on the edge runtime. |
+| Info | No server-side gate on `/dashboard` | Intentional: Guest Mode must render without a session. Cloud data stays protected because every API route enforces its own 401/404. |
+| Medium | Guest notes have no backup | Clearing site data erases them. Promotion to an account is the only durable path, and it is an explicit opt-in prompt rather than an automatic upload. |
+| Low | Guest storage is not reconciled across tabs | Two tabs editing at once are last-write-wins; a `storage` event listener would tighten this. |
+| Low | Guest payload is unencrypted | `localStorage` is readable by any script on the origin and by anyone with device access, so it must never hold secrets. |
 | Medium | Stateless sessions cannot be revoked | A leaked cookie stays valid up to 30 days. A `Session` table (hashed token, `expiresAt`) enables revoke-all on logout/password change. |
 | Medium | No login rate limiting | Add per-IP/email throttling before public launch. |
 | Low | `prisma db push` instead of migration history | Acceptable for a prototype; switch to `prisma migrate` before multi-developer or multi-environment work. |

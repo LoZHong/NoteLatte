@@ -13,6 +13,49 @@ against PostgreSQL (Neon), and cookie-based JWT auth.
 | Auth      | Email + password (bcrypt), HS256 JWT in an HttpOnly cookie (`jose`) |
 | Validation| zod, shared by API routes                                      |
 
+## 💾 Data Lifecycle & Storage Architecture
+
+NoteLatte runs in two mutually exclusive modes. The interface, components and styling are
+identical; only the storage driver behind the page changes.
+
+| | Anonymous / Guest Mode | Cloud Authenticated Mode |
+| --- | --- | --- |
+| Trigger | No session cookie (first visit, signed out, or private window) | Valid `notelatte_session` JWT |
+| Storage | Browser `localStorage`, key `notelatte_guest_notes` | PostgreSQL (Neon) via Prisma |
+| Code path | `guestNotesDriver` — no network | `cloudNotesDriver` → `/api/notes`, `/api/notes/order` |
+| Latency | Zero: reads and writes are local and synchronous | One round trip per mutation |
+| Durability | This browser profile only | Survives reloads, restarts and redeploys |
+| Devices | Single device, single browser | Every device signed into the account |
+| Sync | None | Same account sees the same rows everywhere |
+| Isolation | None — anyone with access to the device can read the payload | bcrypt password, HttpOnly JWT, every query scoped by `userId` (foreign ids return 404) |
+| Limits | ~5 MB `localStorage` quota | Server-side zod validation, 200-char titles, 20k content |
+
+### Guest Mode lifecycle
+
+1. Opening `/dashboard` without a session seeds four example notes into
+   `localStorage["notelatte_guest_notes"]` (only when the key is absent or unreadable).
+2. Every action — create, edit, status cycle, pin, delete, drag reorder — is intercepted by
+   `guestNotesDriver` and written straight back to `localStorage`. In this mode the page makes
+   **no request to `/api/notes` or `/api/notes/order`**; the only API call is `/api/auth/me`, which
+   is how the app learns whether a session exists.
+3. Deliberately emptying the grid keeps it empty; the seed data is not re-created on every load.
+4. Clearing browser data or cache, switching browsers, or closing a private window permanently
+   destroys guest notes. There is no backup and no recovery path.
+
+### Promotion to a cloud account
+
+Signing in never silently uploads local data. If guest notes exist when an account becomes
+active, the dashboard offers a one-time **Import notes** prompt: importing copies each note into
+the account (title, body, status and pin preserved, confirmed server-side per note) and then
+clears the local copy. Dismissing leaves everything local.
+
+### Cloud mode lifecycle
+
+Requests carry the HttpOnly session cookie. Every query filters on `userId` inside the `WHERE`
+clause, so another account's note id returns `404` rather than `403` (no existence leak).
+Passwords are bcrypt hashes; sessions are stateless HS256 JWTs valid for 30 days, so signing out
+clears the cookie but does not revoke an already-issued token.
+
 ## Local setup
 
 ```bash
@@ -64,6 +107,9 @@ lib/
   validation.ts         zod schemas
   serializers.ts        DB rows -> JSON DTOs
   types.ts              shared client/server types
+  note-order.ts         pinned-first comparator shared by both drivers
+  notes-driver.ts       NotesDriver contract + cloud driver (authenticated API)
+  guest-notes.ts        localStorage driver, seeding and import helpers
 prisma/schema.prisma    User + Note models
 ```
 
