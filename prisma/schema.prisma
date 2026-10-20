@@ -30,12 +30,15 @@ model Note {
   // hyphens ("In-Progress", "On-Hold"), which are not valid Prisma enum identifiers.
   // Values are constrained to Todo | In-Progress | On-Hold | Done by zod at the API boundary.
   status    String   @default("Todo")
+  isPinned  Boolean  @default(false)
+  // Manual position within the grid. Lower sorts first; ties fall back to updatedAt.
+  sortOrder Int      @default(0)
   userId    String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId, updatedAt])
+  @@index([userId, isPinned, sortOrder])
   @@map("notes")
 }

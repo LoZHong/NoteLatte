@@ -9,13 +9,7 @@ import { useAuth } from '@/app/auth-context';
 
 export default function LandingPage() {
   const router = useRouter();
-  const { user, isLoading } = useAuth();
-
-  React.useEffect(() => {
-    if (!isLoading && user) {
-      router.replace('/dashboard');
-    }
-  }, [isLoading, user, router]);
+  const { user } = useAuth();
 
   return (
     <div className="min-h-screen bg-neutral-50/60 text-neutral-900">
@@ -29,10 +23,10 @@ export default function LandingPage() {
         </div>
         <Button
           variant="outline"
-          onClick={() => router.push('/auth')}
+          onClick={() => router.push(user ? '/dashboard' : '/auth')}
           className="border-neutral-200 bg-white text-neutral-900 hover:bg-neutral-100"
         >
-          Sign In
+          {user ? 'Open Dashboard' : 'Sign In'}
         </Button>
       </header>
 

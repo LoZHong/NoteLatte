@@ -79,7 +79,7 @@ function AuthPageForm() {
         return;
       }
 
-      router.replace('/');
+      router.replace('/dashboard');
     } finally {
       setIsSubmitting(false);
     }

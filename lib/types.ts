@@ -7,6 +7,8 @@ export type NoteDTO = {
   title: string;
   status: NoteStatus;
   content: string;
+  isPinned: boolean;
+  sortOrder: number;
   updatedAt: number;
 };
 

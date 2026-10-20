@@ -31,6 +31,7 @@ export const createNoteSchema = z.object({
   title: z.string().trim().min(1, 'Title is required.').max(200, 'Title is too long.'),
   content: z.string().max(20000, 'Content is too long.').optional().default(''),
   status: noteStatusSchema.optional().default('Todo'),
+  isPinned: z.boolean().optional().default(false),
 });
 
 export const updateNoteSchema = z
@@ -38,8 +39,17 @@ export const updateNoteSchema = z
     title: z.string().trim().min(1, 'Title is required.').max(200, 'Title is too long.').optional(),
     content: z.string().max(20000, 'Content is too long.').optional(),
     status: noteStatusSchema.optional(),
+    isPinned: z.boolean().optional(),
   })
   .refine((data) => Object.keys(data).length > 0, { message: 'Nothing to update.' });
+
+export const reorderNotesSchema = z.object({
+  ids: z
+    .array(z.string().min(1))
+    .min(1, 'No notes to reorder.')
+    .max(500, 'Too many notes to reorder.')
+    .refine((ids) => new Set(ids).size === ids.length, { message: 'Duplicate note ids.' }),
+});
 
 export function firstIssue(error: z.ZodError): string {
   return error.issues[0]?.message ?? 'Invalid input.';

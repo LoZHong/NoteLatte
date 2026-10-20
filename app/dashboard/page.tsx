@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import {
   NotebookPen,
@@ -12,6 +13,9 @@ import {
   FileText,
   LogOut,
   ChevronDown,
+  Pin,
+  PinOff,
+  GripVertical,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -73,6 +77,20 @@ const STATUS_DOT: Record<Status, string> = {
 
 const FILTERS: ('All' | Status)[] = ['All', ...STATUS_ORDER];
 
+/** Badge click advances the status in this order, wrapping back to Todo. */
+const NEXT_STATUS: Record<Status, Status> = {
+  Todo: 'In-Progress',
+  'In-Progress': 'On-Hold',
+  'On-Hold': 'Done',
+  Done: 'Todo',
+};
+
+function byGridOrder(a: Note, b: Note): number {
+  if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+  if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  return b.updatedAt - a.updatedAt;
+}
+
 function formatRelativeTime(ts: number): string {
   const diff = Date.now() - ts;
   const mins = Math.round(diff / 60000);
@@ -112,6 +130,11 @@ export default function DashboardPage() {
   const [content, setContent] = React.useState('');
   const [formError, setFormError] = React.useState<string | null>(null);
   const [saving, setSaving] = React.useState(false);
+
+  const [draggingId, setDraggingId] = React.useState<string | null>(null);
+  const [dragOverId, setDragOverId] = React.useState<string | null>(null);
+  const lastDragEndRef = React.useRef(0);
+  const patchSeqRef = React.useRef<Record<string, number>>({});
 
   React.useEffect(() => {
     if (!isLoading && !user) {
@@ -239,12 +262,132 @@ export default function DashboardPage() {
     router.replace('/');
   };
 
+  /**
+   * Optimistic single-field update (status cycle / pin toggle).
+   * Each note keeps a request sequence so an out-of-order response for an
+   * earlier click cannot overwrite the newer state.
+   */
+  const patchNote = async (note: Note, patch: { status?: Status; isPinned?: boolean }) => {
+    const seq = (patchSeqRef.current[note.id] ?? 0) + 1;
+    patchSeqRef.current[note.id] = seq;
+
+    setLoadError(null);
+    setNotes((prev) => prev.map((n) => (n.id === note.id ? { ...n, ...patch } : n)));
+
+    const rollback = () => {
+      setNotes((prev) =>
+        prev.map((n) => (n.id === note.id ? { ...n, status: note.status, isPinned: note.isPinned } : n))
+      );
+    };
+
+    try {
+      const response = await fetch(`/api/notes/${note.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        await refreshUser();
+        return;
+      }
+      if (!response.ok) {
+        rollback();
+        setLoadError(await readError(response, 'Could not update the note.'));
+        return;
+      }
+
+      const data = (await response.json()) as { note: Note };
+      if (patchSeqRef.current[note.id] !== seq) return;
+      setNotes((prev) => prev.map((n) => (n.id === data.note.id ? data.note : n)));
+    } catch {
+      rollback();
+      setLoadError('Could not update the note.');
+    }
+  };
+
+  const cycleStatus = (note: Note) => {
+    void patchNote(note, { status: NEXT_STATUS[note.status] });
+  };
+
+  const togglePin = (note: Note) => {
+    void patchNote(note, { isPinned: !note.isPinned });
+  };
+
+  /* Drag-and-drop reordering. Only the unfiltered grid is reorderable, because
+     "index in the visible subset" has no stable meaning once a filter is applied. */
+  const canReorder = activeFilter === 'All' && search.trim() === '';
+
+  const handleDragStart = (event: React.DragEvent<HTMLElement>, note: Note) => {
+    if (!canReorder) {
+      event.preventDefault();
+      return;
+    }
+    setDraggingId(note.id);
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', note.id);
+  };
+
+  const handleDragOver = (event: React.DragEvent<HTMLElement>, note: Note) => {
+    if (!draggingId || note.id === draggingId) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    if (dragOverId !== note.id) setDragOverId(note.id);
+  };
+
+  const handleDrop = async (event: React.DragEvent<HTMLElement>, target: Note) => {
+    event.preventDefault();
+    const sourceId = draggingId ?? event.dataTransfer.getData('text/plain');
+    setDraggingId(null);
+    setDragOverId(null);
+
+    if (!sourceId || sourceId === target.id || !canReorder) return;
+
+    const current = filteredNotes;
+    const from = current.findIndex((n) => n.id === sourceId);
+    const to = current.findIndex((n) => n.id === target.id);
+    if (from < 0 || to < 0) return;
+
+    const reordered = [...current];
+    const [moved] = reordered.splice(from, 1);
+    reordered.splice(to, 0, moved);
+
+    const previous = notes;
+    const positions = new Map(reordered.map((n, index) => [n.id, index]));
+    setNotes((prev) =>
+      prev.map((n) => (positions.has(n.id) ? { ...n, sortOrder: positions.get(n.id) as number } : n))
+    );
+    setLoadError(null);
+
+    try {
+      const response = await fetch('/api/notes/order', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: reordered.map((n) => n.id) }),
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        await refreshUser();
+        return;
+      }
+      if (!response.ok) {
+        setNotes(previous);
+        setLoadError(await readError(response, 'Could not save the new order.'));
+      }
+    } catch {
+      setNotes(previous);
+      setLoadError('Could not save the new order.');
+    }
+  };
+
   const filteredNotes = React.useMemo(() => {
     const q = search.trim().toLowerCase();
     return notes
       .filter((n) => (activeFilter === 'All' ? true : n.status === activeFilter))
       .filter((n) => (q ? n.title.toLowerCase().includes(q) : true))
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+      .sort(byGridOrder);
   }, [notes, activeFilter, search]);
 
   const counts = React.useMemo(() => {
@@ -268,7 +411,11 @@ export default function DashboardPage() {
       <div className="mx-auto max-w-[1400px] px-4 py-8 sm:px-6 lg:px-8">
         {/* Header */}
         <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-2.5">
+          <Link
+            href="/"
+            aria-label="Back to the NoteLatte home page"
+            className="flex w-fit items-center gap-2.5 rounded-lg transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/20"
+          >
             <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-neutral-900 text-white">
               <NotebookPen className="h-5 w-5" />
             </div>
@@ -278,7 +425,7 @@ export default function DashboardPage() {
                 {notes.length} {notes.length === 1 ? 'note' : 'notes'} · organized your way
               </p>
             </div>
-          </div>
+          </Link>
 
           <div className="flex flex-1 items-center gap-3 sm:mx-6 sm:max-w-md sm:flex-none sm:justify-end">
             <div className="relative flex-1">
@@ -377,24 +524,89 @@ export default function DashboardPage() {
             {filteredNotes.map((note) => (
               <article
                 key={note.id}
-                className="group relative flex flex-col rounded-xl border border-neutral-200 bg-white p-4 shadow-sm transition-all hover:-translate-y-0.5 hover:border-neutral-300 hover:shadow-md"
+                role="button"
+                tabIndex={0}
+                aria-label={`Open note: ${note.title}`}
+                draggable={canReorder}
+                onDragStart={(event) => handleDragStart(event, note)}
+                onDragOver={(event) => handleDragOver(event, note)}
+                onDragLeave={() => setDragOverId((current) => (current === note.id ? null : current))}
+                onDrop={(event) => void handleDrop(event, note)}
+                onDragEnd={() => {
+                  lastDragEndRef.current = Date.now();
+                  setDraggingId(null);
+                  setDragOverId(null);
+                }}
+                onClick={() => {
+                  // A drag ends with a click in some browsers; don't open the modal then.
+                  if (Date.now() - lastDragEndRef.current < 250) return;
+                  openEdit(note);
+                }}
+                onKeyDown={(event) => {
+                  if (event.target !== event.currentTarget) return;
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    openEdit(note);
+                  }
+                }}
+                className={cn(
+                  'group relative flex cursor-pointer flex-col rounded-xl border p-4 shadow-sm transition-all hover:-translate-y-0.5 hover:border-neutral-300 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/20',
+                  note.isPinned
+                    ? 'border-neutral-300 bg-neutral-50/50 shadow-md ring-1 ring-neutral-900/[0.04]'
+                    : 'border-neutral-200 bg-white',
+                  draggingId === note.id && 'opacity-40',
+                  dragOverId === note.id && 'ring-2 ring-neutral-900/20'
+                )}
               >
-                <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start justify-between gap-2.5">
                   <h3 className="line-clamp-2 text-[15px] font-semibold leading-snug text-neutral-900">
                     {note.title}
                   </h3>
-                  <span
-                    className={cn(
-                      'inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium',
-                      STATUS_STYLES[note.status]
-                    )}
-                  >
-                    <span className={cn('h-1.5 w-1.5 rounded-full', STATUS_DOT[note.status])} />
-                    {note.status}
-                  </span>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        cycleStatus(note);
+                      }}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      aria-label={`Status: ${note.status}. Click to advance to ${NEXT_STATUS[note.status]}.`}
+                      title={`Click to change status (next: ${NEXT_STATUS[note.status]})`}
+                      className={cn(
+                        'inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-all hover:brightness-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/20 active:scale-95',
+                        STATUS_STYLES[note.status]
+                      )}
+                    >
+                      <span className={cn('h-1.5 w-1.5 rounded-full', STATUS_DOT[note.status])} />
+                      {note.status}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        togglePin(note);
+                      }}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      aria-label={note.isPinned ? 'Unpin note' : 'Pin note'}
+                      aria-pressed={note.isPinned}
+                      title={note.isPinned ? 'Unpin note' : 'Pin note'}
+                      className={cn(
+                        'flex h-7 w-7 items-center justify-center rounded-md transition-all focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/20',
+                        note.isPinned
+                          ? 'bg-neutral-900 text-white hover:bg-neutral-700'
+                          : 'text-neutral-300 opacity-0 hover:bg-neutral-100 hover:text-neutral-700 group-hover:opacity-100 max-sm:opacity-100'
+                      )}
+                    >
+                      {note.isPinned ? (
+                        <Pin className="h-3.5 w-3.5 fill-current" />
+                      ) : (
+                        <PinOff className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  </div>
                 </div>
 
-                <p className="mt-2.5 line-clamp-3 text-sm leading-relaxed text-neutral-600">
+                <p className="mt-2.5 line-clamp-4 whitespace-pre-wrap break-words text-sm leading-relaxed text-neutral-600">
                   {note.content || 'No additional content.'}
                 </p>
 
@@ -405,15 +617,34 @@ export default function DashboardPage() {
                   </span>
 
                   <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                    {canReorder && (
+                      <span
+                        aria-hidden="true"
+                        title="Drag to reorder"
+                        className="flex h-8 w-7 cursor-grab items-center justify-center rounded-md text-neutral-300 active:cursor-grabbing"
+                      >
+                        <GripVertical className="h-4 w-4" />
+                      </span>
+                    )}
                     <button
-                      onClick={() => openEdit(note)}
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openEdit(note);
+                      }}
+                      onKeyDown={(event) => event.stopPropagation()}
                       aria-label="Edit note"
                       className="flex h-8 w-8 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-900"
                     >
                       <Pencil className="h-4 w-4" />
                     </button>
                     <button
-                      onClick={() => handleDelete(note.id)}
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleDelete(note.id);
+                      }}
+                      onKeyDown={(event) => event.stopPropagation()}
                       aria-label="Delete note"
                       className="flex h-8 w-8 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-red-50 hover:text-red-600"
                     >

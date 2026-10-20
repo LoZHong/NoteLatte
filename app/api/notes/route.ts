@@ -17,7 +17,8 @@ export async function GET() {
   try {
     const notes = await prisma.note.findMany({
       where: { userId: session.userId },
-      orderBy: { updatedAt: 'desc' },
+      // Pinned notes first, then manual order, then most recently touched.
+      orderBy: [{ isPinned: 'desc' }, { sortOrder: 'asc' }, { updatedAt: 'desc' }],
     });
     return NextResponse.json({ notes: notes.map(toNoteDTO) });
   } catch (error) {
@@ -45,13 +46,23 @@ export async function POST(request: Request) {
   }
 
   try {
-    const note = await prisma.note.create({
-      data: {
-        title: parsed.data.title,
-        content: parsed.data.content,
-        status: parsed.data.status,
-        userId: session.userId,
-      },
+    // New notes go to the top of their group: one below the current minimum.
+    const note = await prisma.$transaction(async (tx) => {
+      const lowest = await tx.note.aggregate({
+        where: { userId: session.userId },
+        _min: { sortOrder: true },
+      });
+
+      return tx.note.create({
+        data: {
+          title: parsed.data.title,
+          content: parsed.data.content,
+          status: parsed.data.status,
+          isPinned: parsed.data.isPinned,
+          sortOrder: (lowest._min.sortOrder ?? 0) - 1,
+          userId: session.userId,
+        },
+      });
     });
     return NextResponse.json({ note: toNoteDTO(note) }, { status: 201 });
   } catch (error) {

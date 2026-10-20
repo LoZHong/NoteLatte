@@ -8,6 +8,8 @@ export function toNoteDTO(note: Note): NoteDTO {
     title: note.title,
     status: note.status as NoteStatus,
     content: note.content,
+    isPinned: note.isPinned,
+    sortOrder: note.sortOrder,
     updatedAt: note.updatedAt.getTime(),
   };
 }

@@ -57,6 +57,7 @@ app/
     auth/register|login|logout|me/route.ts
     notes/route.ts              GET (list), POST (create)
     notes/[id]/route.ts         PUT (update), DELETE
+    notes/order/route.ts        PUT (persist drag-and-drop order)
 lib/
   prisma.ts             PrismaClient singleton
   auth.ts               JWT sign/verify, session cookie helpers
@@ -69,8 +70,8 @@ prisma/schema.prisma    User + Note models
 ### Data model
 
 - `User`: `id` (cuid), unique `email`, `name`, `passwordHash`, `createdAt`.
-- `Note`: `id` (cuid), `title`, `content`, `status`, `createdAt`, `updatedAt`,
-  `userId` → `User` with `onDelete: Cascade`.
+- `Note`: `id` (cuid), `title`, `content`, `status`, `isPinned`, `sortOrder`,
+  `createdAt`, `updatedAt`, `userId` → `User` with `onDelete: Cascade`.
 
 `status` is stored as text (`Todo` | `In-Progress` | `On-Hold` | `Done`) because the UI values
 contain hyphens, which Prisma enum identifiers cannot express. Values are enforced by zod at the
@@ -88,6 +89,7 @@ API boundary.
 | POST   | `/api/notes`          | ✓    | Note is attached to the caller              |
 | PUT    | `/api/notes/:id`      | ✓    | 404 unless `id` **and** `userId` match      |
 | DELETE | `/api/notes/:id`      | ✓    | 404 unless `id` **and** `userId` match      |
+| PUT    | `/api/notes/order`    | ✓    | Persists manual grid order from `{ ids[] }` |
 
 Every note query filters on `userId` inside the query itself, so a note belonging to another
 account is indistinguishable from one that does not exist (no IDOR, no existence leak).
