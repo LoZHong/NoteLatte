@@ -4,9 +4,9 @@
 | --- | --- |
 | Project | NoteLatte — minimalist Notion-style notes app |
 | Repository | `github.com/LoZHong/NoteLatte` (branch `main`) |
-| Report date | 2026-10-20 18:20 (UTC+8) |
-| Current status | Feature-complete MVP. Build, lint and type checks green. Verified against the production Neon database. Ready for Vercel deployment. |
-| Latest commit | `2a86730` — Add Postgres-backed auth and notes API with Prisma |
+| Report date | 2026-10-20 18:45 (UTC+8) |
+| Current status | Feature-complete MVP plus card interaction pass. Build, lint and type checks green. Verified against the production Neon database. Ready for Vercel deployment. |
+| Latest commit | `19fb950` — Add card interactions: click-to-edit, status cycling, pinning, drag reorder |
 | Working tree | Clean |
 
 ---
@@ -25,6 +25,9 @@ application** with a real relational database and real session authentication.
   `HttpOnly` cookie (`jose`). All data access is scoped to the authenticated `userId`.
 - **Data isolation:** Verified — a second account receives `404` for another account's note id
   (no IDOR, no existence leak).
+- **Interactions:** Click any card to edit it in place; click a status badge to cycle
+  `Todo → In-Progress → On-Hold → Done`; pin a card to float it above the rest; drag cards to
+  reorder them. All four mutations persist to Postgres immediately.
 
 No mock state, no `localStorage` session, and no hardcoded seed array remains in the application
 code. The prototype's 8 demo notes were retired; new accounts start on the existing empty state.
@@ -44,6 +47,7 @@ implementation on day one: **94 minutes** between the UI prototype commit and th
 | 4 | 2026-10-19 19:51 | **Neon DB, Prisma migration, API handlers, auth wiring, build verification** | `2a86730` | Schema pushed via `prisma db push`; 6 route handlers; client swapped to the API; 22-assertion API matrix and a browser walkthrough passed; cold production build green; committed (19 files). |
 | 5 | 2026-10-19 20:07 | **First real usage** (post-handover) | — | Two real accounts created and 6 notes written through the UI, confirming end-to-end persistence outside the test harness. Data preserved. |
 | 6 | 2026-10-20 18:17 | **Re-verification** | — | Cold rebuild, lint, typecheck, API matrix re-run (22/22), test-data cleanup, this report. |
+| 7 | 2026-10-20 18:40 | **UX interaction pass** | `19fb950` | Click-to-edit cards, status badge cycling, pin/unpin with `isPinned` + `sortOrder` columns, drag-and-drop reordering via `PUT /api/notes/order`, pre-formatted multiline card body, header logo link, and a lobby that stays reachable while signed in. |
 
 ### Detail — milestone 4 (the integration)
 
@@ -97,6 +101,7 @@ app/
     auth/me/route.ts         GET   – current profile (200 / 401)
     notes/route.ts           GET   – list own notes; POST – create own note
     notes/[id]/route.ts      PUT   – update own note (404 otherwise); DELETE – delete own note
+    notes/order/route.ts     PUT   – persist manual card order for the caller
 lib/
   prisma.ts               PrismaClient singleton (globalThis guard)
   auth.ts                 JWT signing/verification, cookie name + options, nameFromEmail()
@@ -111,7 +116,7 @@ prisma/schema.prisma      User, Note
 | Model | Fields | Constraints |
 | --- | --- | --- |
 | `User` (`users`) | `id`, `email`, `name`, `passwordHash`, `createdAt` | `id` cuid PK; `email` unique; 1→N `notes` |
-| `Note` (`notes`) | `id`, `title`, `content`, `status`, `userId`, `createdAt`, `updatedAt` | `id` cuid PK; FK `userId` → `users.id`, `onDelete: Cascade`; index on `(userId, updatedAt)`; `updatedAt` auto-maintained |
+| `Note` (`notes`) | `id`, `title`, `content`, `status`, `isPinned`, `sortOrder`, `userId`, `createdAt`, `updatedAt` | `id` cuid PK; FK `userId` → `users.id`, `onDelete: Cascade`; index on `(userId, isPinned, sortOrder)`; `updatedAt` auto-maintained |
 
 `status` is stored as **text**, not a Postgres enum, because the domain values `In-Progress` and
 `On-Hold` contain hyphens, which Prisma enum identifiers cannot express. Values are enforced by
@@ -129,6 +134,7 @@ zod (`Todo | In-Progress | On-Hold | Done`) at the API boundary.
 | POST | `/api/notes` | ✓ | `201 {note}` | 400, 401, 500 |
 | PUT | `/api/notes/:id` | ✓ | `200 {note}` | 400, 401, 404, 500 |
 | DELETE | `/api/notes/:id` | ✓ | `200 {ok}` | 401, 404, 500 |
+| PUT | `/api/notes/order` | ✓ | `200 {ok, count}` | 400 (empty/duplicate ids), 401, 404 (foreign id), 500 |
 
 Notes are serialized with `updatedAt` as **epoch milliseconds**, preserving the existing
 `formatRelativeTime(ts: number)` helper unchanged.
@@ -157,6 +163,26 @@ Notes are serialized with `updatedAt` as **epoch milliseconds**, preserving the 
 - Save failures keep the dialog open so typed content is not lost; delete is optimistic with rollback
   on non-2xx.
 
+### 3.7 Card interaction model
+
+- **Click-to-edit.** The whole `<article>` opens the edit dialog. Inner controls (status badge,
+  pin, edit, delete) call `stopPropagation`; the card also ignores clicks within 250 ms of a drag
+  ending, so a drag never opens a dialog. `Enter`/`Space` on a focused card opens it, and key
+  events from inner buttons stop at the button.
+- **Status cycle.** Badge click advances `Todo → In-Progress → On-Hold → Done → Todo` via
+  `PUT /api/notes/:id { status }`. Optimistic, with single-field rollback and the inline error
+  banner on failure. A per-note sequence counter discards stale responses so rapid clicking
+  cannot be overwritten by an earlier reply.
+- **Pinning.** `isPinned` toggles through the same optimistic path. Sort key is
+  `isPinned DESC, sortOrder ASC, updatedAt DESC`, so pinned cards always lead and keep their
+  relative order; pinned cards get a filled pin control and a tinted surface.
+- **Reordering.** HTML5 drag-and-drop, enabled only when no filter or search is active — "index
+  in the visible subset" has no stable meaning otherwise. A drop reassigns local `sortOrder` and
+  sends `PUT /api/notes/order { ids }`, which rewrites positions in one transaction. The server
+  uses a raw `UPDATE` so `@updatedAt` does not fire and dragged cards keep honest timestamps.
+- **Rendering.** Card bodies use `whitespace-pre-wrap break-words line-clamp-4`, so explicit
+  newlines survive and long tokens wrap instead of overflowing.
+
 ---
 
 ## 4. Current Environment & Verification
@@ -175,7 +201,7 @@ Notes are serialized with `updatedAt` as **epoch milliseconds**, preserving the 
 | Database | Neon PostgreSQL (`neondb`, pooled endpoint, `sslmode=require`) |
 | Vercel CLI | 64.5.0 (installed, **not logged in**) |
 
-### 4.2 Build verification — 2026-10-20 18:17 UTC+8
+### 4.2 Build verification — 2026-10-20 18:40 UTC+8
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -186,11 +212,12 @@ Notes are serialized with `updatedAt` as **epoch milliseconds**, preserving the 
 Route manifest:
 
 ```
-○ /                    3.64 kB      91.7 kB
+○ /                    3.63 kB      91.7 kB
 ○ /auth                3.48 kB      91.6 kB
-○ /dashboard          39.5 kB       128 kB
+○ /dashboard          47.3 kB       135 kB
 λ /api/auth/login      λ /api/auth/logout   λ /api/auth/me
 λ /api/auth/register   λ /api/notes         λ /api/notes/[id]
+λ /api/notes/order
 ```
 
 `○` = prerendered static, `λ` = server-side rendered at runtime. **Zero TypeScript, lint or
@@ -199,7 +226,7 @@ packaging errors.**
 > Note: `next.config.js` sets `eslint.ignoreDuringBuilds: true`, so `next lint` is run separately —
 > a green build alone would not prove lint cleanliness.
 
-### 4.3 API verification against Neon — 22/22 assertions
+### 4.3 API verification against Neon — 52 assertions
 
 Executed against the production build served locally on port 3100 with the real `DATABASE_URL`.
 
@@ -213,18 +240,43 @@ Executed against the production build served locally on port 3100 with the real 
 | Unauthenticated | GET/POST `/api/notes` → 401, `/api/auth/me` → 401 | Pass |
 | Credentials | wrong password (401, generic message), correct password (200) | Pass |
 
+Interaction pass (2026-10-20 18:40) — 30 assertions:
+
+| Group | Assertions | Result |
+| --- | --- | --- |
+| Ordering defaults | `sortOrder` −1/−2/−3 per create, newest first, `isPinned` false by default | Pass |
+| Status | update 200 + persisted, sibling fields untouched, invalid value 400 | Pass |
+| Pinning | toggle persisted, pinned card leads the list, unpinned relative order preserved | Pass |
+| Reorder | `PUT /api/notes/order` 200, new order reflected, `updatedAt` byte-identical, `sortOrder` rewritten 0..1 | Pass |
+| Reorder validation | duplicate ids 400, empty array 400, unauthenticated 401 | Pass |
+| IDOR on new endpoints | foreign reorder 404, foreign pin 404, foreign status 404, second account sees nothing | Pass |
+| Cleanup | three deletes 200, list empty | Pass |
+
 ### 4.4 UI verification (real browser)
 
 signup → dashboard → create note → **hard reload (note returned from Postgres)** → edit → delete →
 logout → deep-link `/dashboard` while signed out redirects to `/`. Screenshots confirmed the
 styling is byte-for-byte the approved design (same Tailwind classes, same palette, same spacing).
 
+Interaction pass, same session:
+
+| Check | Observed |
+| --- | --- |
+| Multiline body | seeded `\n`-separated content renders on separate lines, clamped at four with ellipsis |
+| Badge click | status advanced Todo → In-Progress, chip counts updated, **no dialog opened** |
+| Badge click while card is clickable | inner `stopPropagation` verified — dialog stayed closed |
+| Pin | card jumped to first position, `aria-pressed=true`, tinted surface + filled pin |
+| Card body click | modal opened with title/status/content prefilled |
+| Delete icon | note removed, **no dialog opened** |
+| Drag & drop | Gamma dragged after Alpha → order `Beta, Alpha, Gamma`, still identical after a hard reload |
+| Header logo | navigated to `/` and the lobby rendered for a signed-in user (after removing the old auto-redirect), with "Open Dashboard" in the header |
+
 ### 4.5 Data hygiene
 
-- Verification uses throwaway accounts with timestamped emails, deleted afterwards by explicit
-  email list — never a table truncation.
-- Current database contents: **2 accounts, 6 notes** (real usage created after handover). Preserved
-  as-is.
+- Verification uses throwaway accounts with timestamped `@example.com` addresses, deleted
+  afterwards by explicit email list — never a table truncation.
+- Current database contents: **2 accounts, 7 notes** (real usage created after handover).
+  Preserved as-is.
 
 ---
 
@@ -277,6 +329,8 @@ false-positive readiness signal.
 | Low | Dead scaffold weight | `netlify.toml` + `@netlify/plugin-nextjs` are unused on Vercel; ~39 unused `components/ui/*` files and 10 unused dependencies remain from the template. |
 | Low | `@types/bcryptjs` is redundant | bcryptjs 3 ships its own types; kept per explicit request. |
 | Low | `metadataBase` warning at build | Cosmetic; set in `app/layout.tsx` once a canonical URL exists. |
+| Low | Drag reorder only in the unfiltered view | Deliberate: reordering a filtered subset has no stable index semantics, so the handle is hidden while a filter/search is active. |
+| Low | Card is a `role="button"` containing real buttons | Screen readers can flatten the inner controls. A dedicated "open" affordance would be stricter ARIA; current behaviour is correct for mouse and keyboard. |
 | Info | Missing product features | Password reset, email verification, note sharing, pagination. |
 
 ---
