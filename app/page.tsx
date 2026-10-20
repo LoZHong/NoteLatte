@@ -62,6 +62,19 @@ export default function LandingPage() {
               Sign In
             </Button>
           </div>
+          <div className="mt-5">
+            <button
+              type="button"
+              onClick={() => router.push('/dashboard')}
+              className="group inline-flex items-center gap-1.5 text-sm font-medium text-neutral-600 underline-offset-4 transition-colors hover:text-neutral-900 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/20"
+            >
+              Try Instant Demo as Guest (No sign up required)
+              <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
+            </button>
+            <p className="mt-1.5 text-xs text-neutral-400">
+              Opens the full app immediately — notes stay in this browser and nothing is uploaded.
+            </p>
+          </div>
           <p className="mt-4 text-xs text-neutral-400">No credit card required · Free forever</p>
         </div>
       </section>

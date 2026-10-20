@@ -16,6 +16,8 @@ import {
   Pin,
   PinOff,
   GripVertical,
+  HardDrive,
+  Upload,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -49,15 +51,13 @@ import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/app/auth-context';
 import type { NoteDTO as Note, NoteStatus as Status } from '@/lib/types';
-
-async function readError(response: Response, fallback: string): Promise<string> {
-  try {
-    const data = (await response.json()) as { error?: string };
-    return data.error || fallback;
-  } catch {
-    return fallback;
-  }
-}
+import { compareNotes } from '@/lib/note-order';
+import { cloudNotesDriver, NotesDriverError } from '@/lib/notes-driver';
+import {
+  clearGuestNotes,
+  guestNotesDriver,
+  peekGuestNotes,
+} from '@/lib/guest-notes';
 
 const STATUS_ORDER: Status[] = ['Todo', 'In-Progress', 'On-Hold', 'Done'];
 
@@ -86,9 +86,7 @@ const NEXT_STATUS: Record<Status, Status> = {
 };
 
 function byGridOrder(a: Note, b: Note): number {
-  if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
-  if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
-  return b.updatedAt - a.updatedAt;
+  return compareNotes(a, b);
 }
 
 function formatRelativeTime(ts: number): string {
@@ -117,6 +115,8 @@ export default function DashboardPage() {
   const router = useRouter();
   const { user, isLoading, signOut, refreshUser } = useAuth();
 
+  const isGuest = !user;
+
   const [notes, setNotes] = React.useState<Note[]>([]);
   const [notesLoading, setNotesLoading] = React.useState(false);
   const [loadError, setLoadError] = React.useState<string | null>(null);
@@ -136,43 +136,38 @@ export default function DashboardPage() {
   const lastDragEndRef = React.useRef(0);
   const patchSeqRef = React.useRef<Record<string, number>>({});
 
-  React.useEffect(() => {
-    if (!isLoading && !user) {
-      router.replace('/');
-    }
-  }, [isLoading, user, router]);
+  const [importableGuestNotes, setImportableGuestNotes] = React.useState<Note[] | null>(null);
+  const [importing, setImporting] = React.useState(false);
+
+  // One component, two storage drivers: the API when a session exists, localStorage otherwise.
+  const driver = user ? cloudNotesDriver : guestNotesDriver;
 
   const loadNotes = React.useCallback(async () => {
     setNotesLoading(true);
     setLoadError(null);
     try {
-      const response = await fetch('/api/notes', {
-        cache: 'no-store',
-        credentials: 'same-origin',
-      });
-
-      if (response.status === 401) {
+      setNotes(await driver.list());
+    } catch (error) {
+      if (error instanceof NotesDriverError && error.status === 401) {
         await refreshUser();
         return;
       }
-      if (!response.ok) {
-        setLoadError(await readError(response, 'Could not load your notes.'));
-        return;
-      }
-
-      const data = (await response.json()) as { notes: Note[] };
-      setNotes(data.notes);
-    } catch {
-      setLoadError('Could not load your notes.');
+      setLoadError(error instanceof Error ? error.message : 'Could not load your notes.');
     } finally {
       setNotesLoading(false);
     }
-  }, [refreshUser]);
+  }, [driver, refreshUser]);
 
   React.useEffect(() => {
-    if (!user) return;
+    if (isLoading) return;
     void loadNotes();
-  }, [user, loadNotes]);
+  }, [isLoading, loadNotes]);
+
+  // Signed in with guest notes still sitting in this browser: offer to import them once.
+  React.useEffect(() => {
+    if (isLoading || !user) return;
+    setImportableGuestNotes(peekGuestNotes());
+  }, [isLoading, user]);
 
   const openCreate = () => {
     setEditingId(null);
@@ -200,32 +195,29 @@ export default function DashboardPage() {
     setFormError(null);
 
     try {
-      const payload = { title: trimmedTitle, status, content: content.trim() };
-      const response = await fetch(editingId ? `/api/notes/${editingId}` : '/api/notes', {
-        method: editingId ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        credentials: 'same-origin',
-      });
-
-      if (response.status === 401) {
+      if (editingId) {
+        const updated = await driver.update(editingId, {
+          title: trimmedTitle,
+          status,
+          content: content.trim(),
+        });
+        setNotes((prev) => prev.map((n) => (n.id === updated.id ? updated : n)));
+      } else {
+        const created = await driver.create({
+          title: trimmedTitle,
+          status,
+          content: content.trim(),
+          isPinned: false,
+        });
+        setNotes((prev) => [created, ...prev]);
+      }
+      setModalOpen(false);
+    } catch (error) {
+      if (error instanceof NotesDriverError && error.status === 401) {
         await refreshUser();
         return;
       }
-      if (!response.ok) {
-        setFormError(await readError(response, 'Could not save the note.'));
-        return;
-      }
-
-      const data = (await response.json()) as { note: Note };
-      setNotes((prev) =>
-        editingId
-          ? prev.map((n) => (n.id === data.note.id ? data.note : n))
-          : [data.note, ...prev]
-      );
-      setModalOpen(false);
-    } catch {
-      setFormError('Network error — please try again.');
+      setFormError(error instanceof Error ? error.message : 'Could not save the note.');
     } finally {
       setSaving(false);
     }
@@ -237,23 +229,17 @@ export default function DashboardPage() {
     setNotes((prev) => prev.filter((n) => n.id !== id));
 
     try {
-      const response = await fetch(`/api/notes/${id}`, {
-        method: 'DELETE',
-        credentials: 'same-origin',
-      });
-
-      if (response.status === 401) {
+      await driver.remove(id);
+    } catch (error) {
+      if (error instanceof NotesDriverError && error.status === 401) {
         await refreshUser();
         return;
       }
       // 404 means it is already gone — the UI is already correct.
-      if (!response.ok && response.status !== 404) {
-        setNotes(snapshot);
-        setLoadError(await readError(response, 'Could not delete that note.'));
-      }
-    } catch {
+      if (error instanceof NotesDriverError && error.status === 404) return;
+
       setNotes(snapshot);
-      setLoadError('Could not delete that note.');
+      setLoadError(error instanceof Error ? error.message : 'Could not delete that note.');
     }
   };
 
@@ -281,29 +267,16 @@ export default function DashboardPage() {
     };
 
     try {
-      const response = await fetch(`/api/notes/${note.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-        credentials: 'same-origin',
-      });
-
-      if (response.status === 401) {
+      const updated = await driver.update(note.id, patch);
+      if (patchSeqRef.current[note.id] !== seq) return;
+      setNotes((prev) => prev.map((n) => (n.id === updated.id ? updated : n)));
+    } catch (error) {
+      if (error instanceof NotesDriverError && error.status === 401) {
         await refreshUser();
         return;
       }
-      if (!response.ok) {
-        rollback();
-        setLoadError(await readError(response, 'Could not update the note.'));
-        return;
-      }
-
-      const data = (await response.json()) as { note: Note };
-      if (patchSeqRef.current[note.id] !== seq) return;
-      setNotes((prev) => prev.map((n) => (n.id === data.note.id ? data.note : n)));
-    } catch {
       rollback();
-      setLoadError('Could not update the note.');
+      setLoadError(error instanceof Error ? error.message : 'Could not update the note.');
     }
   };
 
@@ -361,24 +334,47 @@ export default function DashboardPage() {
     setLoadError(null);
 
     try {
-      const response = await fetch('/api/notes/order', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: reordered.map((n) => n.id) }),
-        credentials: 'same-origin',
-      });
-
-      if (response.status === 401) {
+      await driver.reorder(reordered.map((n) => n.id));
+    } catch (error) {
+      if (error instanceof NotesDriverError && error.status === 401) {
         await refreshUser();
         return;
       }
-      if (!response.ok) {
-        setNotes(previous);
-        setLoadError(await readError(response, 'Could not save the new order.'));
-      }
-    } catch {
       setNotes(previous);
-      setLoadError('Could not save the new order.');
+      setLoadError(error instanceof Error ? error.message : 'Could not save the new order.');
+    }
+  };
+
+  /** Moves notes left behind by Guest Mode into the signed-in account. */
+  const handleImportGuestNotes = async () => {
+    if (!importableGuestNotes || importing) return;
+
+    setImporting(true);
+    setLoadError(null);
+    try {
+      const imported: Note[] = [];
+      for (const note of importableGuestNotes) {
+        imported.push(
+          await cloudNotesDriver.create({
+            title: note.title,
+            content: note.content,
+            status: note.status,
+            isPinned: note.isPinned,
+          })
+        );
+      }
+
+      setNotes((prev) => [...imported, ...prev]);
+      clearGuestNotes();
+      setImportableGuestNotes(null);
+    } catch (error) {
+      if (error instanceof NotesDriverError && error.status === 401) {
+        await refreshUser();
+        return;
+      }
+      setLoadError(error instanceof Error ? error.message : 'Could not import your guest notes.');
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -398,7 +394,7 @@ export default function DashboardPage() {
     return map;
   }, [notes]);
 
-  if (isLoading || !user) {
+  if (isLoading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-neutral-50/60 text-neutral-400">
         <NotebookPen className="h-6 w-6 animate-pulse" />
@@ -446,39 +442,100 @@ export default function DashboardPage() {
               <span className="sm:hidden">New</span>
             </Button>
 
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <button
-                  className="flex shrink-0 items-center gap-1.5 rounded-full border border-neutral-200 bg-white py-1 pl-1 pr-2 shadow-sm transition-colors hover:bg-neutral-100"
-                  aria-label="Account menu"
-                >
-                  <Avatar className="h-8 w-8">
-                    <AvatarFallback className="bg-neutral-900 text-xs font-medium text-white">
-                      {initials(user.name)}
-                    </AvatarFallback>
-                  </Avatar>
-                  <ChevronDown className="h-3.5 w-3.5 text-neutral-500" />
-                </button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-56">
-                <DropdownMenuLabel>
-                  <div className="flex flex-col">
-                    <span className="text-sm font-medium text-neutral-900">{user.name}</span>
-                    <span className="truncate text-xs text-neutral-500">{user.email}</span>
-                  </div>
-                </DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onClick={handleSignOut}
-                  className="text-red-600 focus:bg-red-50 focus:text-red-700"
-                >
-                  <LogOut className="mr-2 h-4 w-4" />
-                  Log Out
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            {user ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    className="flex shrink-0 items-center gap-1.5 rounded-full border border-neutral-200 bg-white py-1 pl-1 pr-2 shadow-sm transition-colors hover:bg-neutral-100"
+                    aria-label="Account menu"
+                  >
+                    <Avatar className="h-8 w-8">
+                      <AvatarFallback className="bg-neutral-900 text-xs font-medium text-white">
+                        {initials(user.name)}
+                      </AvatarFallback>
+                    </Avatar>
+                    <ChevronDown className="h-3.5 w-3.5 text-neutral-500" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuLabel>
+                    <div className="flex flex-col">
+                      <span className="text-sm font-medium text-neutral-900">{user.name}</span>
+                      <span className="truncate text-xs text-neutral-500">{user.email}</span>
+                    </div>
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onClick={handleSignOut}
+                    className="text-red-600 focus:bg-red-50 focus:text-red-700"
+                  >
+                    <LogOut className="mr-2 h-4 w-4" />
+                    Log Out
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              <Button
+                variant="outline"
+                onClick={() => router.push('/auth')}
+                className="h-10 shrink-0 border-neutral-300 bg-white text-neutral-900 hover:bg-neutral-100"
+              >
+                Sign In
+              </Button>
+            )}
           </div>
         </header>
+
+        {isGuest && (
+          <div className="mt-6 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50/70 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-2.5">
+              <HardDrive className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <div>
+                <p className="text-sm font-medium text-amber-900">
+                  Guest Mode: Notes are stored in your browser&apos;s Local Storage (Single Device only).
+                </p>
+                <p className="mt-0.5 text-xs text-amber-800">
+                  Clearing your browser data or cache will permanently erase them.
+                </p>
+              </div>
+            </div>
+            <Button
+              onClick={() => router.push('/auth')}
+              className="h-9 shrink-0 bg-amber-900 text-white hover:bg-amber-800"
+            >
+              Sign In to Sync Across Devices
+            </Button>
+          </div>
+        )}
+
+        {user && importableGuestNotes && (
+          <div className="mt-6 flex flex-col gap-3 rounded-xl border border-neutral-200 bg-white px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-2.5">
+              <Upload className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" />
+              <p className="text-sm text-neutral-700">
+                You have {importableGuestNotes.length}{' '}
+                {importableGuestNotes.length === 1 ? 'note' : 'notes'} from Guest Mode saved in this
+                browser. Import them into your account?
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setImportableGuestNotes(null)}
+                className="h-9 border-neutral-200"
+              >
+                Dismiss
+              </Button>
+              <Button
+                onClick={handleImportGuestNotes}
+                disabled={importing}
+                className="h-9 bg-neutral-900 text-white hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {importing ? 'Importing...' : 'Import notes'}
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* Filter bar */}
         <div className="mt-7 flex flex-wrap items-center gap-2">

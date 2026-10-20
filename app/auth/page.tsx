@@ -44,7 +44,8 @@ function AuthPageForm() {
 
   React.useEffect(() => {
     if (!isLoading && user) {
-      router.replace('/');
+      // Already authenticated: nothing to do on this page.
+      router.replace('/dashboard');
     }
   }, [isLoading, user, router]);
 
